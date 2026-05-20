@@ -115,6 +115,16 @@ button {
   color: white;
 }
 
+.day {
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.day:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 8px 20px rgba(2, 6, 23, 0.6);
+}
+
 .missed {
   background: #ef4444;
 }
@@ -129,3 +139,26 @@ button {
   font-size: 12px;
   margin-top: 20px;
 }
+
+/* Day details panel */
+#day-details-container {
+  position: fixed;
+  right: 24px;
+  top: 80px;
+  width: 360px;
+  max-height: 70vh;
+  overflow: auto;
+  z-index: 1200;
+  background: #0b1220;
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(2,6,23,0.7);
+  padding: 16px;
+  color: #e6eef8;
+}
+
+.details-card h2 { margin-top: 0; color: #fb923c; }
+.details-card .close { float: right; background: transparent; border: none; color: #9ca3af; font-size: 18px; cursor: pointer; }
+.details-card ul.activity-list { padding-left: 16px; margin-top: 8px; }
+.details-card li { margin-bottom: 8px; }
+.hidden { display: none; }

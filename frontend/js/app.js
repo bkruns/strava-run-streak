@@ -12,6 +12,21 @@ function setDefaultStartDate() {
 // latest loaded data for sharing
 let latestData = null;
 
+// format `YYYY-MM-DD` -> "May 18, 2026"
+function formatDisplayDate(dateStr) {
+  const d = new Date(dateStr);
+  return d.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+}
+
+// format `YYYY-MM-DDTHH:00` -> "May 18, 2026 7:00am"
+function formatWeatherHour(hourStr) {
+  const d = new Date(hourStr);
+  const datePart = d.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+  let timePart = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", hour12: true });
+  timePart = timePart.replace(" AM", "am").replace(" PM", "pm");
+  return `${datePart} ${timePart}`;
+}
+
 function loginToStrava() {
   const width = 600;
   const height = 700;
@@ -78,13 +93,14 @@ function renderMonthlyMileageAndGrid(data) {
           const dayNumber = new Date(day.date + "T00:00:00").getDate();
 
           return `
-            <div
-              class="day ${day.run_count === 0 ? "missed" : ""}"
-              title="${day.date}: ${day.total_miles} miles"
-            >
-              ${dayNumber}
-            </div>
-          `;
+                <div
+                  class="day ${day.run_count === 0 ? "missed" : ""}"
+                  data-date="${day.date}"
+                  title="${day.date}: ${day.total_miles} miles"
+                >
+                  ${dayNumber}
+                </div>
+              `;
         })
         .join("");
 
@@ -220,6 +236,8 @@ async function loadStreak() {
         Generated from Strava API data
       </div>
     `;
+    // attach click handlers for day details
+    attachDayClickHandlers();
   } catch (err) {
     app.innerHTML = `
       <div class="card">
@@ -235,6 +253,96 @@ async function loadStreak() {
 // initialize the default date before loading
 setDefaultStartDate();
 loadStreak();
+
+// attach click handlers for day elements (idempotent)
+function attachDayClickHandlers() {
+  const appEl = document.getElementById("app");
+  if (!appEl || appEl._dayHandlerAttached) return;
+
+  appEl.addEventListener("click", (e) => {
+    const dayEl = e.target.closest(".day");
+    if (!dayEl) return;
+    const date = dayEl.getAttribute("data-date");
+    if (date) loadDayDetails(date);
+  });
+
+  appEl._dayHandlerAttached = true;
+}
+
+async function loadDayDetails(date) {
+  const loading = document.getElementById("loading");
+  if (loading) loading.classList.remove("hidden");
+
+  try {
+    const resp = await fetch(`${API_BASE_URL}/day-details?date=${date}`);
+    if (!resp.ok) {
+      if (resp.status === 401) {
+        loginToStrava();
+        return;
+      }
+      const err = await resp.json();
+      alert(err.error || "Unable to load day details");
+      return;
+    }
+
+    const data = await resp.json();
+
+    // build details panel
+    let html = `
+      <div class="details-card">
+        <button class="close">✖</button>
+        <h2>Details for ${formatDisplayDate(data.date)}</h2>
+        <p><strong>Total Miles:</strong> ${data.total_miles} — <strong>Runs:</strong> ${data.run_count}</p>
+        <h3>Activities</h3>
+        <ul class="activity-list">
+    `;
+
+    if (data.activities.length === 0) {
+      html += `<li>No activities for this date.</li>`;
+    } else {
+      data.activities.forEach((a) => {
+        html += `<li><strong>${a.name}</strong> — ${a.miles} mi — ${a.moving_time_minutes} min`;
+        if (a.treadmill) {
+          html += ` — Treadmill`;
+        }
+        if (a.avg_miles_per_minute) {
+          // convert miles/min -> minutes per mile
+          const mpm = Number(a.avg_miles_per_minute);
+          if (mpm > 0) {
+            const secondsPerMile = 60 / mpm;
+            const minutes = Math.floor(secondsPerMile / 60);
+            const seconds = Math.round(secondsPerMile % 60);
+            const secStr = String(seconds).padStart(2, "0");
+            html += ` — Pace: ${minutes}:${secStr}/mi`;
+          }
+        }
+        if (a.weather) {
+          html += ` — ${a.weather.temperature_f}°F at ${formatWeatherHour(a.weather.weather_hour)}`;
+        }
+        html += `</li>`;
+      });
+    }
+
+    html += `</ul></div>`;
+
+    let container = document.getElementById("day-details-container");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = "day-details-container";
+      document.body.appendChild(container);
+    }
+
+    container.innerHTML = html;
+    container.classList.remove("hidden");
+
+    const closeBtn = container.querySelector(".close");
+    if (closeBtn) closeBtn.onclick = () => (container.classList.add("hidden"));
+  } catch (err) {
+    alert(err.message || "Error loading details");
+  } finally {
+    if (loading) loading.classList.add("hidden");
+  }
+}
 
 // create an Instagram-story-friendly image (1080x1920)
 function createShareImage() {
