@@ -5,17 +5,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
   <title>BK Runs Streak Dashboard</title>
-
+  <link rel="icon" href="bkruns-transparent.png" />
   <link rel="stylesheet" href="css/styles.css" />
 </head>
 
 <body>
-  <h1>🏃 BK Runs Streak Dashboard</h1>
+  <div class="header-row">
+    <img src="bkruns-transparent.png" alt="BK Runs" class="logo" />
+    <h1>Streak Dashboard</h1>
+  </div>
 
   <div class="toolbar">
-    <button onclick="loginToStrava()">Login to Strava</button>
     <input id="startDate" type="date" />
     <button onclick="loadStreak()">Load Streak</button>
+    <button id="shareBtn" onclick="createShareImage()">Generate Image</button>
   </div>
 
   <div id="loading" class="loading hidden">
