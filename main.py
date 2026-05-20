@@ -735,4 +735,79 @@ def run_streak(start: str = None):
     }
 
 
+@app.get("/day-details")
+def day_details(date: str):
+    """Return full activity details for a specific local date (YYYY-MM-DD),
+    including weather information when available.
+    """
+    access_token = tokens.get("access_token")
+
+    if not access_token:
+        return JSONResponse(
+            {"error": "Not authenticated. Visit /login first."},
+            status_code=401,
+        )
+
+    try:
+        # parse the provided YYYY-MM-DD string into a `date` object without
+        # shadowing the imported `date` name
+        target_date_obj = datetime.strptime(date, "%Y-%m-%d").date()
+    except Exception:
+        return JSONResponse({"error": "Invalid date format, expected YYYY-MM-DD"}, status_code=400)
+
+    # build UTC timestamps for the date range
+    start_dt = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=timezone.utc)
+    end_dt = start_dt + timedelta(days=1)
+
+    response = requests.get(
+        ACTIVITIES_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "after": int(start_dt.timestamp()),
+            "before": int(end_dt.timestamp()),
+            "per_page": 200,
+            "page": 1,
+        },
+        timeout=15,
+    )
+
+    response.raise_for_status()
+    activities = response.json()
+
+    runs = [a for a in activities if a.get("type") == "Run"]
+
+    activity_items = []
+    for a in runs:
+        weather = get_weather_for_activity(a)
+        miles_val = round(a.get("distance", 0) / 1609.344, 2)
+        moving_minutes = round(a.get("moving_time", 0) / 60, 1)
+        avg_miles_per_min = None
+        if moving_minutes and miles_val:
+            try:
+                avg_miles_per_min = round(miles_val / moving_minutes, 4)
+            except Exception:
+                avg_miles_per_min = None
+
+        activity_items.append({
+            "id": a.get("id"),
+            "name": a.get("name"),
+            "type": a.get("type"),
+            "start_date_local": a.get("start_date_local"),
+            "miles": miles_val,
+            "moving_time_minutes": moving_minutes,
+            "treadmill": a.get("trainer") is True,
+            "avg_miles_per_minute": avg_miles_per_min,
+            "weather": weather,
+        })
+
+    total_miles = round(sum(item["miles"] for item in activity_items), 2)
+
+    return {
+        "date": target_date_obj.isoformat(),
+        "run_count": len(activity_items),
+        "total_miles": total_miles,
+        "activities": activity_items,
+    }
+
+
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
