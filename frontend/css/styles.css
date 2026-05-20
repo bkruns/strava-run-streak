@@ -6,6 +6,21 @@ body {
   padding: 24px;
 }
 
+.header-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.logo {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  object-fit: cover;
+  background: transparent;
+}
+
 h1 {
   color: #fb923c;
 }

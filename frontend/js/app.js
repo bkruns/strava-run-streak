@@ -9,6 +9,9 @@ function setDefaultStartDate() {
   input.value = first.toISOString().slice(0, 10);
 }
 
+// latest loaded data for sharing
+let latestData = null;
+
 function loginToStrava() {
   const width = 600;
   const height = 700;
@@ -43,6 +46,12 @@ function groupDaysByMonth(dailyTotals) {
   });
 
   return grouped;
+}
+
+function formatMonthLabel(monthKey) {
+  const [year, month] = monthKey.split("-");
+  const date = new Date(parseInt(year, 10), parseInt(month, 10) - 1, 1);
+  return date.toLocaleString(undefined, { month: "long", year: "numeric" });
 }
 
 function renderMonthlyMileageAndGrid(data) {
@@ -81,7 +90,7 @@ function renderMonthlyMileageAndGrid(data) {
 
       return `
         <div class="month-section">
-          <h3>${month} — ${mileageByMonth[month] || 0} miles</h3>
+          <h3>${formatMonthLabel(month)} — ${mileageByMonth[month] || 0} miles</h3>
 
           <div class="weekday-header">
             <div>Sun</div>
@@ -115,6 +124,11 @@ async function loadStreak() {
     const response = await fetch(`${API_BASE_URL}/run-streak?start=${start}`);
 
     if (!response.ok) {
+      if (response.status === 401) {
+        loginToStrava();
+        return;
+      }
+
       const error = await response.json();
 
       app.innerHTML = `
@@ -129,6 +143,9 @@ async function loadStreak() {
     }
 
     const data = await response.json();
+
+    // store for share/export
+    latestData = data;
 
     app.innerHTML = `
       <div class="grid">
@@ -218,3 +235,145 @@ async function loadStreak() {
 // initialize the default date before loading
 setDefaultStartDate();
 loadStreak();
+
+// create an Instagram-story-friendly image (1080x1920)
+function createShareImage() {
+  if (!latestData) {
+    loginToStrava();
+    return;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = 1080;
+  canvas.height = 1920;
+  const ctx = canvas.getContext("2d");
+
+  const logo = new Image();
+  logo.src = "bkruns-transparent.png";
+
+  function drawShareImage() {
+    // background
+    const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    grad.addColorStop(0, "#0f172a");
+    grad.addColorStop(1, "#071024");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const padding = 60;
+    const logoSize = 108;
+    const contentWidth = canvas.width - padding * 2;
+
+    // logo
+    if (logo.complete && logo.naturalWidth) {
+      ctx.drawImage(logo, padding, padding, logoSize, logoSize);
+    } else {
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(padding, padding, logoSize, logoSize);
+    }
+
+    // streak status
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 58px Arial, sans-serif";
+    ctx.textBaseline = "middle";
+    const statusY = padding + logoSize / 2;
+    ctx.fillStyle = latestData.streak_active ? "#34d399" : "#f97316";
+    ctx.fillText(latestData.streak_active ? "Run Streak Continues" : "Streak Ended", padding + logoSize + 28, statusY);
+    ctx.textBaseline = "alphabetic";
+
+    const statsY = padding + 190;
+    const statsHeight = 180;
+    ctx.fillStyle = "rgba(15, 23, 42, 0.88)";
+    ctx.fillRect(padding - 20, statsY - 20, contentWidth + 40, statsHeight);
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.1)";
+    ctx.strokeRect(padding - 20, statsY - 20, contentWidth + 40, statsHeight);
+
+    // key stats block
+    ctx.fillStyle = "#fff";
+    ctx.font = "34px Arial, sans-serif";
+    ctx.fillText(`Total Miles: ${latestData.total_miles}`, padding, statsY + 10);
+    ctx.fillText(`Run Days: ${latestData.run_days}`, padding, statsY + 72);
+    ctx.fillText(`Avg / Run Day: ${latestData.average_miles_per_run_day}`, padding, statsY + 134);
+
+    const grouped = {};
+    latestData.daily_totals.forEach((day) => {
+      const month = day.date.substring(0, 7);
+      if (!grouped[month]) grouped[month] = [];
+      grouped[month].push(day);
+    });
+
+    const months = Object.keys(grouped).sort((a, b) => b.localeCompare(a));
+    const latestMonth = months.length ? months[0] : null;
+
+    if (latestMonth) {
+      const monthData = grouped[latestMonth];
+      const [yearStr, monthStr] = latestMonth.split("-");
+      const year = parseInt(yearStr, 10);
+      const monthIndex = parseInt(monthStr, 10) - 1;
+      const firstDate = new Date(year, monthIndex, 1);
+      const firstWeekday = firstDate.getDay();
+      const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+
+      const totalMiles = latestData.monthly_totals.find((m) => m.month === latestMonth)?.total_miles || 0;
+      const cellSize = 96;
+      const gap = 14;
+      const gridWidth = 7 * cellSize + 6 * gap;
+      const gridX = Math.max(padding, (canvas.width - gridWidth) / 2);
+      const gridY = padding + 440;
+
+      ctx.font = "bold 36px Arial, sans-serif";
+      ctx.fillStyle = "#fff";
+      ctx.fillText(`${formatMonthLabel(latestMonth)} — ${totalMiles} miles`, padding, gridY - 42);
+
+      const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+      ctx.font = "22px Arial, sans-serif";
+      weekdays.forEach((label, idx) => {
+        ctx.fillStyle = "#cbd5e1";
+        ctx.fillText(label, gridX + idx * (cellSize + gap) + 18, gridY - 2);
+      });
+
+      const dayMap = {};
+      monthData.forEach((entry) => {
+        dayMap[entry.date] = entry;
+      });
+
+      for (let row = 0; row < 6; row++) {
+        for (let col = 0; col < 7; col++) {
+          const cellX = gridX + col * (cellSize + gap);
+          const cellY = gridY + row * (cellSize + gap);
+          const calendarDay = row * 7 + col - firstWeekday + 1;
+
+          if (calendarDay < 1 || calendarDay > daysInMonth) {
+            ctx.fillStyle = "rgba(255, 255, 255, 0.05)";
+            ctx.fillRect(cellX, cellY, cellSize, cellSize);
+            continue;
+          }
+
+          const dateKey = `${yearStr}-${monthStr.padStart(2, "0")}-${String(calendarDay).padStart(2, "0")}`;
+          const entry = dayMap[dateKey];
+          const ran = entry && entry.run_count > 0;
+
+          ctx.fillStyle = ran ? "#34d399" : "#1f2937";
+          ctx.fillRect(cellX, cellY, cellSize, cellSize);
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+          ctx.strokeRect(cellX, cellY, cellSize, cellSize);
+
+          ctx.fillStyle = ran ? "#02160d" : "#d1d5db";
+          ctx.font = "bold 26px Arial, sans-serif";
+          ctx.fillText(String(calendarDay), cellX + 16, cellY + 48);
+        }
+      }
+    }
+
+    canvas.toBlob(function (blob) {
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank");
+    }, "image/png");
+  }
+
+  if (logo.complete && logo.naturalWidth) {
+    drawShareImage();
+  } else {
+    logo.onload = drawShareImage;
+    logo.onerror = drawShareImage;
+  }
+}
