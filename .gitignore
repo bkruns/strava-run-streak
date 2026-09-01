@@ -3,4 +3,8 @@
 .vscode/
 __pycache__/
 *.pyc
+strava_cache.json
+strava_cache.json.tmp
+data/
 Pipfile.lock
+data/*

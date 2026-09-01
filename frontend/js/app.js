@@ -1,12 +1,45 @@
 const API_BASE_URL = "http://localhost:8000";
 
+async function getResponseError(response, fallbackMessage) {
+  const contentType = response.headers.get("content-type") || "";
+
+  if (contentType.includes("application/json")) {
+    try {
+      const body = await response.json();
+      return body.error || body.detail || fallbackMessage;
+    } catch (_) {
+      // Fall through when a server labels an invalid body as JSON.
+    }
+  } else {
+    // Consume non-JSON responses so they can be reported without calling json().
+    await response.text().catch(() => "");
+  }
+
+  return response.status >= 500
+    ? "The server encountered an error. Check the server logs and try again."
+    : fallbackMessage;
+}
+
 // set default start date to first day of current month
 function setDefaultStartDate() {
   const input = document.getElementById("startDate");
   if (!input) return;
   const now = new Date();
   const first = new Date(now.getFullYear(), now.getMonth(), 1);
-  input.value = first.toISOString().slice(0, 10);
+  input.value = formatLocalDate(first);
+
+  const shareMonth = document.getElementById("shareMonth");
+  if (shareMonth) {
+    shareMonth.value = formatLocalDate(first).slice(0, 7);
+    shareMonth.max = formatLocalDate(now).slice(0, 7);
+  }
+}
+
+function formatLocalDate(value) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 // latest loaded data for sharing
@@ -145,12 +178,12 @@ async function loadStreak() {
         return;
       }
 
-      const error = await response.json();
+      const error = await getResponseError(response, "Unable to load data");
 
       app.innerHTML = `
         <div class="card">
           <h2>Unable to Load Data</h2>
-          <p>${error.error || "Unknown error"}</p>
+          <p>${error}</p>
           <p>Try logging into Strava first.</p>
         </div>
       `;
@@ -280,8 +313,8 @@ async function loadDayDetails(date) {
         loginToStrava();
         return;
       }
-      const err = await resp.json();
-      alert(err.error || "Unable to load day details");
+      const error = await getResponseError(resp, "Unable to load day details");
+      alert(error);
       return;
     }
 
@@ -345,10 +378,67 @@ async function loadDayDetails(date) {
 }
 
 // create an Instagram-story-friendly image (1080x1920)
-function createShareImage() {
-  if (!latestData) {
-    loginToStrava();
+async function createShareImage() {
+  const shareButton = document.getElementById("shareBtn");
+  const selectedMonth = document.getElementById("shareMonth").value;
+  const selectedStart = document.getElementById("startDate").value;
+  if (!selectedMonth || !selectedStart) return;
+
+  const [year, month] = selectedMonth.split("-").map(Number);
+  const monthStart = new Date(year, month - 1, 1);
+  const monthEnd = new Date(year, month, 0);
+  const today = new Date();
+  const rangeEnd = monthEnd > today ? today : monthEnd;
+
+  shareButton.disabled = true;
+  shareButton.textContent = "Generating…";
+
+  if (selectedStart > formatLocalDate(rangeEnd)) {
+    alert("The streak start date must be on or before the selected month.");
+    shareButton.disabled = false;
+    shareButton.textContent = "Generate Image";
     return;
+  }
+
+  let shareData;
+  let grandData;
+  try {
+    const monthlyParams = new URLSearchParams({
+      start: formatLocalDate(monthStart),
+      end: formatLocalDate(rangeEnd),
+      refresh: "false",
+    });
+    const grandParams = new URLSearchParams({
+      start: selectedStart,
+      end: formatLocalDate(rangeEnd),
+      refresh: "false",
+    });
+    const [monthlyResponse, grandResponse] = await Promise.all([
+      fetch(`${API_BASE_URL}/run-streak?${monthlyParams}`),
+      fetch(`${API_BASE_URL}/run-streak?${grandParams}`),
+    ]);
+    if (monthlyResponse.status === 401 || grandResponse.status === 401) {
+      loginToStrava();
+      return;
+    }
+    if (!monthlyResponse.ok) {
+      const error = await getResponseError(monthlyResponse, "Unable to generate image");
+      throw new Error(error);
+    }
+    if (!grandResponse.ok) {
+      const error = await getResponseError(grandResponse, "Unable to calculate grand totals");
+      throw new Error(error);
+    }
+    [shareData, grandData] = await Promise.all([
+      monthlyResponse.json(),
+      grandResponse.json(),
+    ]);
+  } catch (err) {
+    alert(err.message || "Unable to generate image");
+    return;
+  } finally {
+    shareButton.disabled = false;
+    shareButton.textContent = "Generate Image";
   }
 
   const canvas = document.createElement("canvas");
@@ -384,26 +474,33 @@ function createShareImage() {
     ctx.font = "bold 58px Arial, sans-serif";
     ctx.textBaseline = "middle";
     const statusY = padding + logoSize / 2;
-    ctx.fillStyle = latestData.streak_active ? "#34d399" : "#f97316";
-    ctx.fillText(latestData.streak_active ? "Run Streak Continues" : "Streak Ended", padding + logoSize + 28, statusY);
+    ctx.fillStyle = shareData.streak_active ? "#34d399" : "#f97316";
+    ctx.fillText(shareData.streak_active ? "Run Streak Continues" : "Streak Ended", padding + logoSize + 28, statusY);
     ctx.textBaseline = "alphabetic";
 
     const statsY = padding + 190;
-    const statsHeight = 180;
+    const statsHeight = 250;
     ctx.fillStyle = "rgba(15, 23, 42, 0.88)";
     ctx.fillRect(padding - 20, statsY - 20, contentWidth + 40, statsHeight);
     ctx.strokeStyle = "rgba(255, 255, 255, 0.1)";
     ctx.strokeRect(padding - 20, statsY - 20, contentWidth + 40, statsHeight);
 
-    // key stats block
+    // Grand totals and selected-month totals.
     ctx.fillStyle = "#fff";
-    ctx.font = "34px Arial, sans-serif";
-    ctx.fillText(`Total Miles: ${latestData.total_miles}`, padding, statsY + 10);
-    ctx.fillText(`Run Days: ${latestData.run_days}`, padding, statsY + 72);
-    ctx.fillText(`Avg / Run Day: ${latestData.average_miles_per_run_day}`, padding, statsY + 134);
+    ctx.font = "bold 30px Arial, sans-serif";
+    ctx.fillText("Grand Totals", padding, statsY + 8);
+    ctx.fillText(formatMonthLabel(selectedMonth), padding + 510, statsY + 8);
+
+    ctx.font = "27px Arial, sans-serif";
+    ctx.fillText(`Miles: ${grandData.total_miles}`, padding, statsY + 65);
+    ctx.fillText(`Run Days: ${grandData.run_days}`, padding, statsY + 119);
+    ctx.fillText(`Average Miles: ${grandData.average_miles_per_run_day}`, padding, statsY + 173);
+    ctx.fillText(`Miles: ${shareData.total_miles}`, padding + 510, statsY + 65);
+    ctx.fillText(`Run Days: ${shareData.run_days}`, padding + 510, statsY + 119);
+    ctx.fillText(`Average Miles: ${shareData.average_miles_per_run_day}`, padding + 510, statsY + 173);
 
     const grouped = {};
-    latestData.daily_totals.forEach((day) => {
+    shareData.daily_totals.forEach((day) => {
       const month = day.date.substring(0, 7);
       if (!grouped[month]) grouped[month] = [];
       grouped[month].push(day);
@@ -421,12 +518,12 @@ function createShareImage() {
       const firstWeekday = firstDate.getDay();
       const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
 
-      const totalMiles = latestData.monthly_totals.find((m) => m.month === latestMonth)?.total_miles || 0;
+      const totalMiles = shareData.monthly_totals.find((m) => m.month === latestMonth)?.total_miles || 0;
       const cellSize = 96;
       const gap = 14;
       const gridWidth = 7 * cellSize + 6 * gap;
       const gridX = Math.max(padding, (canvas.width - gridWidth) / 2);
-      const gridY = padding + 440;
+      const gridY = padding + 510;
 
       ctx.font = "bold 36px Arial, sans-serif";
       ctx.fillStyle = "#fff";

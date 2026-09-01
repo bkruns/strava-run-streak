@@ -1,6 +1,10 @@
 import os
+import json
 import logging
 import requests
+import threading
+from functools import wraps
+from pathlib import Path
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request
@@ -14,6 +18,17 @@ from datetime import date, datetime, timedelta, timezone
 load_dotenv()
 
 app = FastAPI()
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception(
+        "Unhandled error while serving %s %s", request.method, request.url.path
+    )
+    return JSONResponse(
+        {"error": "Internal server error. Check the server logs for details."},
+        status_code=500,
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,8 +45,22 @@ REDIRECT_URI = os.getenv("STRAVA_REDIRECT_URI")
 AUTH_URL = "https://www.strava.com/oauth/authorize"
 TOKEN_URL = "https://www.strava.com/api/v3/oauth/token"
 ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
+METERS_PER_MILE = 1609.344
 
 tokens = {}
+
+CACHE_PATH = Path(os.getenv("STRAVA_CACHE_PATH", "strava_cache.json"))
+CACHE_REFRESH_DAYS = 5
+CACHE_LOCK = threading.RLock()
+
+
+def synchronized_cache(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        with CACHE_LOCK:
+            return function(*args, **kwargs)
+
+    return wrapper
 
 # configure basic logging
 logger = logging.getLogger("strava_api")
@@ -164,6 +193,70 @@ def get_activity_temp_stats(activity_id: int, access_token: str):
     }
 
 
+def get_activity_pace_data(activity: dict, access_token: str):
+    """Download and format the pace stream for a newly fetched run."""
+    activity_id = activity.get("id")
+    if activity_id is None:
+        return None
+
+    response = requests.get(
+        f"https://www.strava.com/api/v3/activities/{activity_id}/streams",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "keys": "time,distance,velocity_smooth",
+            "key_by_type": "true",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    streams = response.json()
+
+    times = streams.get("time", {}).get("data", [])
+    distances = streams.get("distance", {}).get("data", [])
+    velocities = streams.get("velocity_smooth", {}).get("data", [])
+    sample_count = min(len(times), len(distances), len(velocities))
+
+    samples = []
+    for index in range(sample_count):
+        velocity = velocities[index]
+        if not isinstance(velocity, (int, float)) or velocity <= 0:
+            continue
+
+        seconds_per_mile = METERS_PER_MILE / velocity
+        samples.append({
+            "elapsed_seconds": times[index],
+            "distance_meters": round(distances[index], 1),
+            "meters_per_second": round(velocity, 3),
+            "seconds_per_mile": round(seconds_per_mile, 1),
+            "pace": format_pace(seconds_per_mile),
+        })
+
+    distance_meters = activity.get("distance") or 0
+    moving_seconds = activity.get("moving_time") or 0
+    average_seconds_per_mile = (
+        moving_seconds / miles(distance_meters)
+        if distance_meters > 0 and moving_seconds > 0
+        else None
+    )
+
+    return {
+        "average_seconds_per_mile": (
+            round(average_seconds_per_mile, 1)
+            if average_seconds_per_mile is not None
+            else None
+        ),
+        "average_pace": (
+            format_pace(average_seconds_per_mile)
+            if average_seconds_per_mile is not None
+            else None
+        ),
+        "average_speed_meters_per_second": activity.get("average_speed"),
+        "max_speed_meters_per_second": activity.get("max_speed"),
+        "sample_count": len(samples),
+        "samples": samples,
+    }
+
+
 @app.get("/last-week-stats")
 def weekly_stats():
     access_token = tokens.get("access_token")
@@ -177,20 +270,9 @@ def weekly_stats():
     now = datetime.now(timezone.utc)
     week_start = now - timedelta(days=7)
 
-    response = requests.get(
-        ACTIVITIES_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={
-            "after": int(week_start.timestamp()),
-            "before": int(now.timestamp()),
-            "per_page": 100,
-            "page": 1,
-        },
-        timeout=15,
+    activities = fetch_cached_activities(
+        access_token, week_start.date(), now.date()
     )
-
-    response.raise_for_status()
-    activities = response.json()
 
     runs = [
         activity
@@ -331,6 +413,7 @@ def is_outdoor_activity(activity: dict) -> bool:
     return activity.get("trainer") is not True
 
 
+@synchronized_cache
 def get_weather_for_activity(activity: dict):
     latlng = activity.get("start_latlng")
 
@@ -347,8 +430,15 @@ def get_weather_for_activity(activity: dict):
         start_date_local.replace("Z", "+00:00")
     )
 
-    activity_date = activity_time.date().isoformat()
     activity_hour = activity_time.strftime("%Y-%m-%dT%H:00")
+
+    activity_date = activity_time.date().isoformat()
+    activity_id = str(activity.get("id"))
+    cache = load_data_cache()
+    cached_day = cache["weather"].get(activity_date, {})
+
+    if not should_refresh_date(activity_time.date()) and activity_id in cached_day:
+        return cached_day[activity_id]
 
     response = requests.get(
         "https://archive-api.open-meteo.com/v1/archive",
@@ -371,20 +461,23 @@ def get_weather_for_activity(activity: dict):
     times = hourly.get("time", [])
     temps = hourly.get("temperature_2m", [])
 
-    if activity_hour not in times:
-        return None
+    result = None
+    if activity_hour in times:
+        index = times.index(activity_hour)
+        result = {
+            "activity_id": activity.get("id"),
+            "name": activity.get("name"),
+            "type": activity.get("type"),
+            "sport_type": activity.get("sport_type"),
+            "date": start_date_local,
+            "weather_hour": activity_hour,
+            "temperature_f": temps[index],
+        }
 
-    index = times.index(activity_hour)
-
-    return {
-        "activity_id": activity.get("id"),
-        "name": activity.get("name"),
-        "type": activity.get("type"),
-        "sport_type": activity.get("sport_type"),
-        "date": start_date_local,
-        "weather_hour": activity_hour,
-        "temperature_f": temps[index],
-    }
+    cache = load_data_cache()
+    cache["weather"].setdefault(activity_date, {})[activity_id] = result
+    save_data_cache(cache)
+    return result
 
 
 @app.get("/weekly-outdoor-temp")
@@ -400,20 +493,9 @@ def weekly_outdoor_temp():
     now = datetime.now(timezone.utc)
     week_start = now - timedelta(days=7)
 
-    response = requests.get(
-        ACTIVITIES_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={
-            "after": int(week_start.timestamp()),
-            "before": int(now.timestamp()),
-            "per_page": 100,
-            "page": 1,
-        },
-        timeout=15,
+    activities = fetch_cached_activities(
+        access_token, week_start.date(), now.date()
     )
-
-    response.raise_for_status()
-    activities = response.json()
 
     outdoor_activities = [
         activity
@@ -467,20 +549,7 @@ def weekly_stats(weeks: int = 1):
     now = datetime.now(timezone.utc)
     start = now - timedelta(weeks=weeks)
 
-    response = requests.get(
-        ACTIVITIES_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={
-            "after": int(start.timestamp()),
-            "before": int(now.timestamp()),
-            "per_page": 200,
-            "page": 1,
-        },
-        timeout=15,
-    )
-
-    response.raise_for_status()
-    activities = response.json()
+    activities = fetch_cached_activities(access_token, start.date(), now.date())
 
     runs = [
         activity
@@ -580,7 +649,7 @@ def format_pace(seconds_per_mile: float) -> str:
     return f"{minutes}:{seconds:02d}/mi"
 
 def miles(meters: float) -> float:
-    return meters / 1609.344
+    return meters / METERS_PER_MILE
 
 
 def parse_strava_local_date(activity: dict) -> date:
@@ -619,8 +688,154 @@ def fetch_activities_since(access_token: str, start_date: date):
     return all_activities
 
 
+def empty_data_cache():
+    return {"version": 1, "activities": {}, "weather": {}}
+
+
+def load_data_cache():
+    if not CACHE_PATH.exists():
+        return empty_data_cache()
+
+    try:
+        with CACHE_PATH.open("r", encoding="utf-8") as cache_file:
+            cache = json.load(cache_file)
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Unable to read %s; starting with an empty cache", CACHE_PATH)
+        return empty_data_cache()
+
+    cache.setdefault("version", 1)
+    cache.setdefault("activities", {})
+    cache.setdefault("weather", {})
+    return cache
+
+
+def save_data_cache(cache):
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = CACHE_PATH.with_suffix(CACHE_PATH.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as cache_file:
+        json.dump(cache, cache_file, indent=2, sort_keys=True)
+        cache_file.write("\n")
+    temporary_path.replace(CACHE_PATH)
+
+
+def should_refresh_date(day: date, today: date = None):
+    today = today or datetime.now().date()
+    return day >= today - timedelta(days=CACHE_REFRESH_DAYS - 1)
+
+
+def cache_weather_for_activities(activities):
+    for activity in activities:
+        if not is_outdoor_activity(activity) or not activity.get("start_latlng"):
+            continue
+
+        try:
+            get_weather_for_activity(activity)
+        except requests.RequestException:
+            logger.exception(
+                "Unable to fetch weather for activity %s", activity.get("id")
+            )
+
+
+def add_pace_data_to_new_runs(activities, access_token: str):
+    """Enrich new run summaries before they are persisted in the JSON cache."""
+    for activity in activities:
+        if activity.get("type") != "Run" or "pace_data" in activity:
+            continue
+
+        try:
+            activity["pace_data"] = get_activity_pace_data(activity, access_token)
+        except requests.RequestException:
+            logger.exception(
+                "Unable to fetch pace data for activity %s", activity.get("id")
+            )
+
+
+@synchronized_cache
+def fetch_cached_activities(access_token: str, start_date: date, end_date: date = None):
+    """Return activities by local date, refreshing today and the prior four days.
+
+    Empty days are persisted too, so historical dates without activities do not
+    cause another Strava request on every read.
+    """
+    today = datetime.now().date()
+    end_date = min(end_date or today, today)
+    if start_date > end_date:
+        return []
+
+    cache = load_data_cache()
+    cached_dates = cache["activities"]
+    requested_days = [
+        start_date + timedelta(days=offset)
+        for offset in range((end_date - start_date).days + 1)
+    ]
+    cached_requested_days = [
+        day for day in requested_days if day.isoformat() in cached_dates
+    ]
+    missing_days = [
+        day for day in requested_days if day.isoformat() not in cached_dates
+    ]
+    refresh_days = [
+        day for day in requested_days
+        if should_refresh_date(day, today) and day not in missing_days
+    ]
+    dates_to_fetch = [
+        day for day in requested_days
+        if should_refresh_date(day, today) or day.isoformat() not in cached_dates
+    ]
+
+    logger.info(
+        "Activity cache plan range=%s..%s cached=%s pull=%s missing=%s refresh=%s",
+        start_date.isoformat(),
+        end_date.isoformat(),
+        [day.isoformat() for day in cached_requested_days],
+        [day.isoformat() for day in dates_to_fetch],
+        [day.isoformat() for day in missing_days],
+        [day.isoformat() for day in refresh_days],
+    )
+
+    if dates_to_fetch:
+        fetch_start = min(dates_to_fetch)
+        fetched = fetch_activities_since(access_token, fetch_start)
+        add_pace_data_to_new_runs(fetched, access_token)
+        fetched_by_date = defaultdict(list)
+        for activity in fetched:
+            try:
+                activity_date = parse_strava_local_date(activity)
+            except (KeyError, ValueError):
+                continue
+            if fetch_start <= activity_date <= end_date:
+                fetched_by_date[activity_date.isoformat()].append(activity)
+
+        # A broad Strava request may span cached history. Only replace dates that
+        # are missing or inside the rolling refresh window.
+        for day in dates_to_fetch:
+            cached_dates[day.isoformat()] = fetched_by_date[day.isoformat()]
+        save_data_cache(cache)
+
+    activities = [
+        activity
+        for day in requested_days
+        for activity in cached_dates.get(day.isoformat(), [])
+    ]
+    cache_weather_for_activities(activities)
+    return activities
+
+
+@synchronized_cache
+def read_cached_activities(start_date: date, end_date: date):
+    """Return a date range exactly as stored, without any external requests."""
+    cached_dates = load_data_cache()["activities"]
+    return [
+        activity
+        for offset in range((end_date - start_date).days + 1)
+        for activity in cached_dates.get(
+            (start_date + timedelta(days=offset)).isoformat(), []
+        )
+    ]
+
+
 @app.get("/run-streak")
-def run_streak(start: str = None):
+def run_streak(start: str = None, end: str = None, refresh: bool = True):
     access_token = tokens.get("access_token")
 
     if not access_token:
@@ -629,14 +844,30 @@ def run_streak(start: str = None):
             status_code=401,
         )
 
-    # default to the first day of the current month when no start provided
+    # Default to month-to-date, while allowing historical ranges for exports.
     today = datetime.now().date()
-    if start:
-        start_date = date.fromisoformat(start)
-    else:
-        start_date = today.replace(day=1)
+    try:
+        start_date = date.fromisoformat(start) if start else today.replace(day=1)
+        end_date = date.fromisoformat(end) if end else today
+    except ValueError:
+        return JSONResponse(
+            {"error": "Dates must use YYYY-MM-DD format."},
+            status_code=400,
+        )
 
-    activities = fetch_activities_since(access_token, start_date)
+    if end_date > today:
+        end_date = today
+    if start_date > end_date:
+        return JSONResponse(
+            {"error": "Start date must be on or before end date."},
+            status_code=400,
+        )
+
+    activities = (
+        fetch_cached_activities(access_token, start_date, end_date)
+        if refresh
+        else read_cached_activities(start_date, end_date)
+    )
 
     runs = [
         activity
@@ -654,7 +885,7 @@ def run_streak(start: str = None):
 
     all_days = [
         start_date + timedelta(days=offset)
-        for offset in range((today - start_date).days + 1)
+        for offset in range((end_date - start_date).days + 1)
     ]
 
     missed_days = [
@@ -712,7 +943,7 @@ def run_streak(start: str = None):
     return {
         "period": {
             "start": start_date.isoformat(),
-            "end": today.isoformat(),
+            "end": end_date.isoformat(),
         },
         "streak_active": len(missed_days) == 0,
         "total_days": len(all_days),
@@ -755,24 +986,9 @@ def day_details(date: str):
     except Exception:
         return JSONResponse({"error": "Invalid date format, expected YYYY-MM-DD"}, status_code=400)
 
-    # build UTC timestamps for the date range
-    start_dt = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=timezone.utc)
-    end_dt = start_dt + timedelta(days=1)
-
-    response = requests.get(
-        ACTIVITIES_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={
-            "after": int(start_dt.timestamp()),
-            "before": int(end_dt.timestamp()),
-            "per_page": 200,
-            "page": 1,
-        },
-        timeout=15,
+    activities = fetch_cached_activities(
+        access_token, target_date_obj, target_date_obj
     )
-
-    response.raise_for_status()
-    activities = response.json()
 
     runs = [a for a in activities if a.get("type") == "Run"]
 
@@ -797,6 +1013,7 @@ def day_details(date: str):
             "moving_time_minutes": moving_minutes,
             "treadmill": a.get("trainer") is True,
             "avg_miles_per_minute": avg_miles_per_min,
+            "pace_data": a.get("pace_data"),
             "weather": weather,
         })
 
