@@ -460,6 +460,15 @@ async function createShareImage() {
     const padding = 60;
     const logoSize = 108;
     const contentWidth = canvas.width - padding * 2;
+    const cellSize = 96;
+    const gap = 14;
+    const contentBottom = padding + 510 + 5 * (cellSize + gap) + cellSize;
+    const contentHeight = contentBottom - padding;
+    const verticalOffset = (canvas.height - contentHeight) / 2 - padding;
+
+    // Center the complete share card within the Instagram Story canvas.
+    ctx.save();
+    ctx.translate(0, verticalOffset);
 
     // logo
     if (logo.complete && logo.naturalWidth) {
@@ -519,8 +528,6 @@ async function createShareImage() {
       const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
 
       const totalMiles = shareData.monthly_totals.find((m) => m.month === latestMonth)?.total_miles || 0;
-      const cellSize = 96;
-      const gap = 14;
       const gridWidth = 7 * cellSize + 6 * gap;
       const gridX = Math.max(padding, (canvas.width - gridWidth) / 2);
       const gridY = padding + 510;
@@ -568,6 +575,8 @@ async function createShareImage() {
         }
       }
     }
+
+    ctx.restore();
 
     canvas.toBlob(function (blob) {
       const url = URL.createObjectURL(blob);
